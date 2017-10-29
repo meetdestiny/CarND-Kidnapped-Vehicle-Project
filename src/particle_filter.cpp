@@ -17,6 +17,8 @@
 
 #include "particle_filter.h"
 
+#define EPS 0.0001
+
 using namespace std;
 
 void ParticleFilter::init(double x, double y, double theta, double std[]) {
@@ -25,6 +27,33 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
 	// Add random Gaussian noise to each particle.
 	// NOTE: Consult particle_filter.h for more information about this method (and others in this file).
 
+
+	num_particles = 100;
+
+	particles = std::vector<Particle>(num_particles);
+
+	std::default_random_engine gen;
+	std::normal_distribution<double> x_dist(x, std[0]);
+	std::normal_distribution<double> y_dist(y, std[1]);
+	std::normal_distribution<double> theta_dist(theta, std[2]);
+
+	int id = 0;
+	for(auto& particle : particles){
+		particle.id = id;
+		particle.x = x_dist(gen);
+		particle.y = y_dist(gen);
+		particle.theta = theta_dist(gen);
+		particle.weight = 1.0;
+		id++;
+	}
+
+	weights = std::vector<double>(num_particles);
+	for(int i = 0; i < num_particles; i++){
+		weights[i] = 1.0;
+	}
+
+	is_initialized = true;
+
 }
 
 void ParticleFilter::prediction(double delta_t, double std_pos[], double velocity, double yaw_rate) {
@@ -32,6 +61,31 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
 	// NOTE: When adding noise you may find std::normal_distribution and std::default_random_engine useful.
 	//  http://en.cppreference.com/w/cpp/numeric/random/normal_distribution
 	//  http://www.cplusplus.com/reference/random/default_random_engine/
+
+
+	std::default_random_engine gen;
+
+	double dist =  delta_t * velocity;
+	double delta_theta = yaw_rate * delta_t;
+	double vy = velocity / yaw_rate;
+
+
+	for(auto& particle : particles){
+		if (fabs(yaw_rate) < EPS){
+			particle.x += dist * cos(particle.theta);
+			particle.y += dist * sin(particle.theta);
+		} else {
+			double theta = delta_theta  + particle.theta;
+			particle.x += vy * (sin(theta) - sin(particle.theta));
+			particle.y += vy * (cos(particle.theta) - cos(theta));
+			particle.theta += delta_theta;
+		}
+
+		// add noise
+		particle.x = std::normal_distribution<double>(particle.x, std_pos[0])(gen);
+		particle.y = std::normal_distribution<double>(particle.y, std_pos[1])(gen);
+		particle.theta = std::normal_distribution<double>(particle.theta, std_pos[2])(gen);
+	}
 
 }
 
@@ -55,6 +109,73 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 	//   and the following is a good resource for the actual equation to implement (look at equation 
 	//   3.33
 	//   http://planning.cs.uiuc.edu/node99.html
+
+
+	double std_x2 = std_landmark[0] * std_landmark[0];
+	double std_y2 = std_landmark[1] * std_landmark[1];
+	double coeff = 1/(2 * M_PI * std_landmark[0] * std_landmark[1]);
+
+	for(auto& particle : particles){
+		double x = particle.x;
+		double y = particle.y;
+		double theta = particle.theta;
+
+		//  landmarks within sensor range
+		std::vector<Map::single_landmark_s> landmarks;
+		for(auto& landmark : map_landmarks.landmark_list){
+			if (landmark.x_f > x - sensor_range && landmark.x_f < x + sensor_range && landmark.y_f > y - sensor_range && landmark.y_f < y + sensor_range){
+				landmarks.push_back(landmark);
+			}
+		}
+
+		// transform observations to coordinates of particle
+		std::vector<LandmarkObs> tobservations(observations.size());
+		for(int i = 0; i < observations.size(); i++){
+			tobservations[i].x = x + observations[i].x * cos(theta) - observations[i].y * sin(theta);
+			tobservations[i].y = y + observations[i].x * sin(theta) + observations[i].y * cos(theta);
+		}
+
+		//find  the closest landmark for each transformed observation
+		vector<int> associations(tobservations.size());
+		vector<double> sense_x(tobservations.size());
+		vector<double> sense_y(tobservations.size());
+
+		for(int i = 0; i < tobservations.size(); i++){
+			double x = tobservations[i].x;
+			double y = tobservations[i].y;
+			double min_distance = std::numeric_limits<double>::max();
+			int best_landmark_id = 0;
+			double best_x = 0.0;
+			double best_y = 0.0;
+
+			for(auto& landmark : landmarks){
+				double distance = dist(x,y,landmark.x_f, landmark.y_f);
+				if (distance < min_distance){
+					min_distance = distance;
+					best_landmark_id = landmark.id_i;
+					best_x = landmark.x_f;
+					best_y = landmark.y_f;
+				}
+			}
+			associations[i] = best_landmark_id;
+			sense_x[i] = best_x;
+			sense_y[i] = best_y;
+		}
+
+		particle = SetAssociations(particle, associations, sense_x, sense_y);
+
+		double weight = 1.0;
+		for(int i = 0; i < associations.size(); i++){
+			double x = tobservations[i].x;
+			double y = tobservations[i].y;
+			double e = pow(x - sense_x[i], 2.0) / (2 * std_x2) + pow(y - sense_y[i], 2.0) / (2 * std_y2);
+			double res = exp(-e);
+			weight *= res;
+		}
+		particle.weight = weight;
+		weights[particle.id] = weight;
+	}
+
 }
 
 void ParticleFilter::resample() {
@@ -62,7 +183,18 @@ void ParticleFilter::resample() {
 	// NOTE: You may find std::discrete_distribution helpful here.
 	//   http://en.cppreference.com/w/cpp/numeric/random/discrete_distribution
 
+	std::discrete_distribution<> dist(weights.begin(), weights.end());
+	std::default_random_engine gen;
+
+	std::vector<Particle> sampled_particles(particles.size());
+	for(int i = 0; i < particles.size(); i++){
+		int index = dist(gen);
+		sampled_particles[i] = particles[index];
+		sampled_particles[i].id = i;
+	}
+	particles = sampled_particles;
 }
+
 
 Particle ParticleFilter::SetAssociations(Particle particle, std::vector<int> associations, std::vector<double> sense_x, std::vector<double> sense_y)
 {
@@ -77,36 +209,36 @@ Particle ParticleFilter::SetAssociations(Particle particle, std::vector<int> ass
 	particle.sense_y.clear();
 
 	particle.associations= associations;
- 	particle.sense_x = sense_x;
- 	particle.sense_y = sense_y;
+	particle.sense_x = sense_x;
+	particle.sense_y = sense_y;
 
- 	return particle;
+	return particle;
 }
 
 string ParticleFilter::getAssociations(Particle best)
 {
 	vector<int> v = best.associations;
 	stringstream ss;
-    copy( v.begin(), v.end(), ostream_iterator<int>(ss, " "));
-    string s = ss.str();
-    s = s.substr(0, s.length()-1);  // get rid of the trailing space
-    return s;
+	copy( v.begin(), v.end(), ostream_iterator<int>(ss, " "));
+	string s = ss.str();
+	s = s.substr(0, s.length()-1);  // get rid of the trailing space
+	return s;
 }
 string ParticleFilter::getSenseX(Particle best)
 {
 	vector<double> v = best.sense_x;
 	stringstream ss;
-    copy( v.begin(), v.end(), ostream_iterator<float>(ss, " "));
-    string s = ss.str();
-    s = s.substr(0, s.length()-1);  // get rid of the trailing space
-    return s;
+	copy( v.begin(), v.end(), ostream_iterator<float>(ss, " "));
+	string s = ss.str();
+	s = s.substr(0, s.length()-1);  // get rid of the trailing space
+	return s;
 }
 string ParticleFilter::getSenseY(Particle best)
 {
 	vector<double> v = best.sense_y;
 	stringstream ss;
-    copy( v.begin(), v.end(), ostream_iterator<float>(ss, " "));
-    string s = ss.str();
-    s = s.substr(0, s.length()-1);  // get rid of the trailing space
-    return s;
+	copy( v.begin(), v.end(), ostream_iterator<float>(ss, " "));
+	string s = ss.str();
+	s = s.substr(0, s.length()-1);  // get rid of the trailing space
+	return s;
 }
